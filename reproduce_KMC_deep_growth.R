@@ -7,10 +7,6 @@
 ##    (3) LSTM/GRU autoencoders  (4) outcome-by-phenotype
 ##    (5) early prediction       (6) tables & figures
 ##
-##  NOTE. The manuscript numbers were produced by the Python engine of record.
-##  This script mirrors that methodology in R; because LCTM here uses lcmm
-##  growth-mixture estimation (random intercept) and the deep models are
-##  stochastic, exact figures may differ slightly. Seeds are fixed throughout.
 ##
 # install.packages(c("readxl","dplyr","tidyr","lcmm","mclust","aricode", "caret",
 # "randomForest","gbm","pROC","ggplot2","patchwork", "caret","tibble", "data.table"))
@@ -27,18 +23,10 @@
 # 
 # 
 # ###############################################################################
-# 
-# suppressPackageStartupMessages({
-#   library(readxl); library(dplyr); library(tidyr); library(tibble)
-#   library(lcmm); library(mclust); library(aricode)
-#   library(randomForest); library(gbm); library(pROC)
-#   library(ggplot2); library(patchwork); library(caret)
-#   library(keras3)
-# })
 
 
 # ============================================
-# MAIN SCRIPT - CORRECTED FOR DR. ARASH
+# MAIN SCRIPT - CORRECTED FOR MY COMPUTER
 # ============================================
 
 # Set environment (add at the very beginning)
@@ -117,7 +105,7 @@ ids <- sort(unique(win$infant))
 ## baseline covariates (birth row = lowest PMA)
 birth <- raw %>% group_by(infant) %>% slice_min(PMA_W, n = 1, with_ties = FALSE) %>% ungroup()
 base <- tibble(infant = ids) %>%
-  left_join(birth %>% transmute(infant, sex_male = as.integer(SEX == "Male"),
+  left_join(birth %>% transmute(infant, sex_male = as.integer(!is.na(SEX) & SEX == "Male"),
                                 GA, BWZ = F13_W_Z), by = "infant")
 early <- raw %>% filter(PMA_W < 50, !is.na(F13_W_Z)) %>%
   group_by(infant) %>% slice_max(PMA_W, n = 1, with_ties = FALSE) %>%
@@ -129,11 +117,11 @@ base <- base %>% left_join(early, by = "infant") %>%
 last <- win %>% group_by(infant) %>% slice_max(PMA_W, n = 1, with_ties = FALSE) %>% ungroup()
 base <- base %>% left_join(
   last %>% transmute(infant,
-    underweight = as.integer(WAZ < -2), stunting = as.integer(LAZ < -2),
-    wasting = as.integer(WLZ < -2),     overweight = as.integer(BMIZ > 2),
+    underweight = as.integer(!is.na(WAZ) & WAZ < -2), stunting = as.integer(!is.na(LAZ) & LAZ < -2),
+    wasting = as.integer(!is.na(WLZ) & WLZ < -2),     overweight = as.integer(!is.na(BMIZ) & BMIZ > 2),
     CA_M_last = CA_M, WAZ_last = WAZ, LAZ_last = LAZ,
     WLZ_last = WLZ, HCZ_last = HCZ, BMIZ_last = BMIZ), by = "infant") %>%
-  filter(!is.na(BWZ), !is.na(GA))
+  filter(!is.na(BWZ), !is.na(GA), !is.na(earlyWAZgain))
 ids <- base$infant
 cat(sprintf("Infants: %d | outcomes U/S/W/O = %d/%d/%d/%d\n", nrow(base),
   sum(base$underweight), sum(base$stunting), sum(base$wasting), sum(base$overweight)))
@@ -270,20 +258,23 @@ make_folds <- function(y, k = 5) createFolds(factor(y), k = k, returnTrain = FAL
 oof_tab <- function(model, y) {
   folds <- make_folds(y); p <- numeric(length(y))
   for (te in folds) {
-    tr <- setdiff(seq_along(y), te)
-    sc <- preProcess(Xtab[tr,], method = c("center","scale"))
-    Xtr <- predict(sc, Xtab[tr,]); Xte <- predict(sc, Xtab[te,])
+    tr   <- setdiff(seq_along(y), te)
+    Xtr0 <- Xtab[tr, , drop = FALSE]; Xte0 <- Xtab[te, , drop = FALSE]
+    ctr  <- colMeans(Xtr0); sdv <- apply(Xtr0, 2, sd); sdv[sdv == 0] <- 1
+    Xtr  <- scale(Xtr0, center = ctr, scale = sdv)
+    Xte  <- scale(Xte0, center = ctr, scale = sdv)
+    dtr  <- as.data.frame(Xtr); dtr$.y <- y[tr]
     if (model == "logistic") {
-      fit <- glm(y[tr] ~ ., data = data.frame(Xtr), family = binomial,
-                 weights = ifelse(y[tr]==1, sum(y[tr]==0)/sum(y[tr]==1), 1))
-      p[te] <- predict(fit, data.frame(Xte), type = "response")
+      w   <- ifelse(y[tr] == 1, sum(y[tr] == 0) / sum(y[tr] == 1), 1)
+      fit <- suppressWarnings(glm(.y ~ ., data = dtr, family = binomial, weights = w))
+      p[te] <- predict(fit, as.data.frame(Xte), type = "response")
     } else if (model == "rf") {
-      fit <- randomForest(x = Xtr, y = factor(y[tr]), ntree = 300, classwt = c(1, sum(y[tr]==0)/max(sum(y[tr]==1),1)))
+      fit <- randomForest(x = Xtr, y = factor(y[tr], levels = c(0, 1)), ntree = 300)
       p[te] <- predict(fit, Xte, type = "prob")[, "1"]
     } else if (model == "gbm") {
-      fit <- gbm(y[tr] ~ ., data = data.frame(Xtr),
-                 distribution = "bernoulli", n.trees = 300, interaction.depth = 2, verbose = FALSE)
-      p[te] <- predict(fit, data.frame(Xte), n.trees = 300, type = "response")
+      fit <- gbm(.y ~ ., data = dtr, distribution = "bernoulli",
+                 n.trees = 300, interaction.depth = 2, verbose = FALSE)
+      p[te] <- suppressWarnings(predict(fit, as.data.frame(Xte), n.trees = 300, type = "response"))
     }
   }
   p
@@ -292,22 +283,25 @@ oof_tab <- function(model, y) {
 oof_deep <- function(cell, y) {
   folds <- make_folds(y); p <- numeric(length(y)); Tn <- length(EG)
   for (te in folds) {
-    tr <- setdiff(seq_along(y), te)
-    mu <- mean(early_seq[tr,]); sdv <- sd(early_seq[tr,])
-    sm <- colMeans(STAT[tr,]); ss <- apply(STAT[tr,], 2, sd) + 1e-6
-    Xtr <- array((early_seq[tr,]-mu)/sdv, dim=c(length(tr),Tn,1))
-    Xte <- array((early_seq[te,]-mu)/sdv, dim=c(length(te),Tn,1))
-    Str <- sweep(sweep(STAT[tr,],2,sm),2,ss,"/"); Ste <- sweep(sweep(STAT[te,],2,sm),2,ss,"/")
-    seq_in <- layer_input(shape = c(Tn,1)); st_in <- layer_input(shape = c(ncol(STAT)))
-    h <- if (cell=="LSTM") layer_lstm(seq_in, units=16) else layer_gru(seq_in, units=16)
-    z <- layer_concatenate(list(h, st_in)) %>% layer_dense(16, activation="relu") %>%
-         layer_dropout(0.2) %>% layer_dense(1, activation="sigmoid")
+    tr    <- setdiff(seq_along(y), te)
+    es_tr <- early_seq[tr, , drop = FALSE]; es_te <- early_seq[te, , drop = FALSE]
+    st_tr <- STAT[tr, , drop = FALSE];      st_te <- STAT[te, , drop = FALSE]
+    mu <- mean(es_tr); sdv <- sd(es_tr); if (sdv == 0) sdv <- 1
+    sm <- colMeans(st_tr); ss <- apply(st_tr, 2, sd); ss[ss == 0] <- 1
+    Xtr <- array((es_tr - mu) / sdv, dim = c(length(tr), Tn, 1))
+    Xte <- array((es_te - mu) / sdv, dim = c(length(te), Tn, 1))
+    Str <- sweep(sweep(st_tr, 2, sm), 2, ss, "/")
+    Ste <- sweep(sweep(st_te, 2, sm), 2, ss, "/")
+    seq_in <- layer_input(shape = c(Tn, 1)); st_in <- layer_input(shape = c(ncol(STAT)))
+    h <- if (cell == "LSTM") layer_lstm(seq_in, units = 16) else layer_gru(seq_in, units = 16)
+    z <- layer_concatenate(list(h, st_in)) %>% layer_dense(16, activation = "relu") %>%
+         layer_dropout(0.2) %>% layer_dense(1, activation = "sigmoid")
     clf <- keras_model(list(seq_in, st_in), z)
-    cw <- list(`0`=1, `1`=as.numeric(sum(y[tr]==0)/max(sum(y[tr]==1),1)))
-    compile(clf, optimizer=optimizer_adam(learning_rate = 0.01), loss="binary_crossentropy")
-    fit(clf, list(Xtr, Str), y[tr], epochs=160, batch_size=length(tr),
-        class_weight=cw, verbose=0)
-    p[te] <- as.numeric(predict(clf, list(Xte, Ste), verbose=0))
+    cw  <- list(`0` = 1, `1` = as.numeric(sum(y[tr] == 0) / max(sum(y[tr] == 1), 1)))
+    compile(clf, optimizer = optimizer_adam(learning_rate = 0.01), loss = "binary_crossentropy")
+    fit(clf, list(Xtr, Str), y[tr], epochs = 160, batch_size = length(tr),
+        class_weight = cw, verbose = 0)
+    p[te] <- as.numeric(predict(clf, list(Xte, Ste), verbose = 0))
   }
   p
 }
